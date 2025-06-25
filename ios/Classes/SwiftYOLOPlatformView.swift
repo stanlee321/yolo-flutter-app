@@ -20,6 +20,8 @@ public class SwiftYOLOPlatformView: NSObject, FlutterPlatformView, FlutterStream
   // Event channel for sending detection results
   private let eventChannel: FlutterEventChannel
   private var eventSink: FlutterEventSink?
+  // MODIFIED: Add a queue to hold events if the sink is not ready
+  private var eventQueue: [[String: Any]] = []
 
   // Method channel for receiving control commands
   private let methodChannel: FlutterMethodChannel
@@ -376,36 +378,6 @@ public class SwiftYOLOPlatformView: NSObject, FlutterPlatformView, FlutterStream
               code: "invalid_args", message: "Invalid arguments for setModel", details: nil))
         }
 
-      case "captureFrame":
-        // Method to capture current camera frame with detection overlays
-        print("SwiftYOLOPlatformView: Received captureFrame call")
-        self.yoloView?.capturePhoto { [weak self] image in
-          if let image = image {
-            // Convert UIImage to byte array (JPEG format)
-            if let imageData = image.jpegData(compressionQuality: 0.9) {
-              // Convert to FlutterStandardTypedData for efficient transfer
-              let flutterData = FlutterStandardTypedData(bytes: imageData)
-              result(flutterData)
-            } else {
-              result(
-                FlutterError(
-                  code: "conversion_failed",
-                  message: "Failed to convert captured image to JPEG data",
-                  details: nil
-                )
-              )
-            }
-          } else {
-            result(
-              FlutterError(
-                code: "capture_failed",
-                message: "Failed to capture photo from camera",
-                details: nil
-              )
-            )
-          }
-        }
-
       // Additional methods can be added here in the future
 
       default:
@@ -442,21 +414,24 @@ public class SwiftYOLOPlatformView: NSObject, FlutterPlatformView, FlutterStream
     }
   }
 
+  // MODIFIED: This method now queues events if the sink is not ready.
   /// Send stream data to Flutter via event channel
   private func sendStreamDataToFlutter(_ streamData: [String: Any]) {
-    print(
-      "SwiftYOLOPlatformView: Sending stream data to Flutter: \(streamData.keys.joined(separator: ", "))"
-    )
-
-    guard let eventSink = self.eventSink else {
-      print("SwiftYOLOPlatformView: eventSink is nil - no listener for events")
-      return
-    }
-
-    // Send event on main thread
     DispatchQueue.main.async {
-      print("SwiftYOLOPlatformView: Sending stream data to Flutter via eventSink")
-      eventSink(streamData)
+      if let sink = self.eventSink {
+        // If there are queued events, send them first
+        while !self.eventQueue.isEmpty {
+          let queuedEvent = self.eventQueue.removeFirst()
+          sink(queuedEvent)
+          print("SwiftYOLOPlatformView: Sent a queued event to Flutter.")
+        }
+        // Send the current event
+        sink(streamData)
+      } else {
+        // If sink is not ready, queue the event
+        print("SwiftYOLOPlatformView: eventSink is nil, queueing event.")
+        self.eventQueue.append(streamData)
+      }
     }
   }
 
@@ -466,12 +441,21 @@ public class SwiftYOLOPlatformView: NSObject, FlutterPlatformView, FlutterStream
 
   // MARK: - FlutterStreamHandler Protocol
 
+  // MODIFIED: This method now sends any queued events when the listener connects.
   public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink)
     -> FlutterError?
   {
     print("SwiftYOLOPlatformView: onListen called - Stream handler connected")
     self.eventSink = events
-    print("SwiftYOLOPlatformView: eventSink set successfully")
+    
+    // Send any queued events
+    while !self.eventQueue.isEmpty {
+        let queuedEvent = self.eventQueue.removeFirst()
+        events(queuedEvent)
+        print("SwiftYOLOPlatformView: Sent a queued event immediately after listen.")
+    }
+    
+    print("SwiftYOLOPlatformView: eventSink set successfully and queue flushed.")
     return nil
   }
 

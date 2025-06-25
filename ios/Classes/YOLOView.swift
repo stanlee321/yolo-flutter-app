@@ -15,10 +15,15 @@
 import AVFoundation
 import UIKit
 import Vision
+import Flutter // ADDED: Import Flutter to use FlutterStandardTypedData
+
 
 /// A UIView component that provides real-time object detection, segmentation, and pose estimation capabilities.
 @MainActor
 public class YOLOView: UIView, VideoCaptureDelegate {
+  private let dataProcessingQueue: DispatchQueue = DispatchQueue(label: "com.ultralytics.yolo.dataProcessingQueue")
+
+  
   func onInferenceTime(speed: Double, fps: Double) {
     // Store performance data for streaming
     self.currentFps = fps
@@ -30,77 +35,74 @@ public class YOLOView: UIView, VideoCaptureDelegate {
   }
 
   func onPredict(result: YOLOResult) {
+    // This method is called from a background thread by the predictor.
 
-    // Check if we should process inference result based on frequency control
+    // Check if we should process this frame based on throttling/frequency settings.
     if !shouldRunInference() {
-      print("YOLOView: Skipping inference result due to frequency control")
+      // print("YOLOView: Skipping inference result due to frequency control")
       return
     }
+    updateLastInferenceTime()
 
-    showBoxes(predictions: result)
-    onDetection?(result)
-
-    // Streaming callback (with output throttling)
+    // --- Prepare Data for Flutter ---
+    // This part is now done first, on the current background thread, to avoid memory issues.
+    var streamData: [String: Any]? = nil
     if let streamCallback = onStream {
-      if shouldProcessFrame() {
-        updateLastInferenceTime()
-
-        // Convert to stream data and send
-        let streamData = convertResultToStreamData(result)
+        // Convert the result to a dictionary. This is where the expensive image conversion happens.
+        streamData = self.convertResultToStreamData(result)
+        
         // Add timestamp and frame info
-        var enhancedStreamData = streamData
-        enhancedStreamData["timestamp"] = Int64(Date().timeIntervalSince1970 * 1000)  // milliseconds
-        enhancedStreamData["frameNumber"] = frameNumberCounter
-        frameNumberCounter += 1
-
-        streamCallback(enhancedStreamData)
-        print("YOLOView: Sent streaming data with \(result.boxes.count) detections")
-      } else {
-        print("YOLOView: Skipping frame output due to throttling")
-      }
+        streamData?["timestamp"] = Int64(Date().timeIntervalSince1970 * 1000)
+        streamData?["frameNumber"] = self.frameNumberCounter
     }
 
-    if task == .segment {
-      DispatchQueue.main.async {
-        if let maskImage = result.masks?.combinedMask {
+    // --- Dispatch UI Updates and Data Sending to the Main Thread ---
+    DispatchQueue.main.async {
+      // Update UI elements like bounding boxes and labels
+      self.showBoxes(predictions: result)
+      self.onDetection?(result) // Call the simple detection callback if provided
 
-          guard let maskLayer = self.maskLayer else { return }
+      // Send the prepared data to Flutter via the event channel
+      if let finalStreamData = streamData {
+          self.frameNumberCounter += 1
+          self.onStream?(finalStreamData)
+      }
 
+      // Handle task-specific UI layer updates (masks, poses, etc.)
+      if self.task == .segment {
+        if let maskImage = result.masks?.combinedMask, let maskLayer = self.maskLayer {
           maskLayer.isHidden = false
           maskLayer.frame = self.overlayLayer.bounds
           maskLayer.contents = maskImage
-
-          self.videoCapture.predictor.isUpdating = false
-        } else {
-          self.videoCapture.predictor.isUpdating = false
+        }
+        self.videoCapture.predictor.isUpdating = false
+      } else if self.task == .classify {
+        self.overlayYOLOClassificationsCALayer(on: self, result: result)
+      } else if self.task == .pose {
+        self.removeAllSubLayers(parentLayer: self.poseLayer)
+        if let poseLayer = self.poseLayer {
+            var keypointList = [[(x: Float, y: Float)]]()
+            var confsList = [[Float]]()
+            for keypoint in result.keypointsList {
+                keypointList.append(keypoint.xyn)
+                confsList.append(keypoint.conf)
+            }
+            drawKeypoints(
+                keypointsList: keypointList, confsList: confsList, boundingBoxes: result.boxes,
+                on: poseLayer, imageViewSize: self.overlayLayer.frame.size, originalImageSize: result.orig_shape)
+        }
+      } else if self.task == .obb {
+        if let obbLayer = self.obbLayer {
+            let obbDetections = result.obb
+            self.obbRenderer.drawObbDetectionsWithReuse(
+                obbDetections: obbDetections,
+                on: obbLayer,
+                imageViewSize: self.overlayLayer.frame.size,
+                originalImageSize: result.orig_shape,
+                lineWidth: 3
+            )
         }
       }
-    } else if task == .classify {
-      self.overlayYOLOClassificationsCALayer(on: self, result: result)
-    } else if task == .pose {
-      self.removeAllSubLayers(parentLayer: poseLayer)
-      var keypointList = [[(x: Float, y: Float)]]()
-      var confsList = [[Float]]()
-
-      for keypoint in result.keypointsList {
-        keypointList.append(keypoint.xyn)
-        confsList.append(keypoint.conf)
-      }
-      guard let poseLayer = poseLayer else { return }
-      drawKeypoints(
-        keypointsList: keypointList, confsList: confsList, boundingBoxes: result.boxes,
-        on: poseLayer, imageViewSize: overlayLayer.frame.size, originalImageSize: result.orig_shape)
-    } else if task == .obb {
-      //            self.setupObbLayerIfNeeded()
-      guard let obbLayer = self.obbLayer else { return }
-      let obbDetections = result.obb
-      self.obbRenderer.drawObbDetectionsWithReuse(
-        obbDetections: obbDetections,
-        on: obbLayer,
-        imageViewSize: self.overlayLayer.frame.size,
-        originalImageSize: result.orig_shape,  // 例
-        lineWidth: 3
-      )
     }
   }
 
@@ -437,9 +439,8 @@ public class YOLOView: UIView, VideoCaptureDelegate {
       layer.frame = self.overlayLayer.bounds
       layer.opacity = 0.5
       layer.name = "maskLayer"
-      // Set contentsGravity to match the overlay scaling
-      layer.contentsGravity = .resizeAspectFill
-      layer.masksToBounds = true
+      // Specify contentsGravity or backgroundColor as needed
+      // layer.contentsGravity = .resizeAspectFill
       // layer.backgroundColor = UIColor.clear.cgColor
 
       self.overlayLayer.addSublayer(layer)
@@ -1291,125 +1292,6 @@ extension YOLOView: AVCapturePhotoCaptureDelegate {
       let imageLayer = imageView.layer
       self.layer.insertSublayer(imageLayer, above: videoCapture.previewLayer)
 
-      // Add mask layer if present (for segmentation task)
-      var tempMaskLayer: CALayer?
-      if let maskLayer = self.maskLayer, !maskLayer.isHidden {
-        // Create a temporary copy of the mask layer for capture
-        let tempLayer = CALayer()
-        // Calculate the correct frame relative to the main view
-        let overlayFrame = self.overlayLayer.frame
-        let maskFrame = maskLayer.frame
-
-        // Adjust mask frame to be relative to the main view, not overlayLayer
-        tempLayer.frame = CGRect(
-          x: overlayFrame.origin.x + maskFrame.origin.x,
-          y: overlayFrame.origin.y + maskFrame.origin.y,
-          width: maskFrame.width,
-          height: maskFrame.height
-        )
-        tempLayer.contents = maskLayer.contents
-        tempLayer.contentsGravity = maskLayer.contentsGravity
-        tempLayer.contentsRect = maskLayer.contentsRect
-        tempLayer.contentsCenter = maskLayer.contentsCenter
-        tempLayer.opacity = maskLayer.opacity
-        tempLayer.compositingFilter = maskLayer.compositingFilter
-        tempLayer.transform = maskLayer.transform
-        tempLayer.masksToBounds = maskLayer.masksToBounds
-        self.layer.insertSublayer(tempLayer, above: imageLayer)
-        tempMaskLayer = tempLayer
-      }
-
-      // Add pose layer if present (for pose task)
-      var tempPoseLayer: CALayer?
-      if let poseLayer = self.poseLayer {
-        // Create a temporary copy of the pose layer including all sublayers
-        let tempLayer = CALayer()
-        let overlayFrame = self.overlayLayer.frame
-
-        // Set frame relative to main view
-        tempLayer.frame = CGRect(
-          x: overlayFrame.origin.x,
-          y: overlayFrame.origin.y,
-          width: overlayFrame.width,
-          height: overlayFrame.height
-        )
-        tempLayer.opacity = poseLayer.opacity
-
-        // Copy all sublayers (keypoints and skeleton lines)
-        if let sublayers = poseLayer.sublayers {
-          for sublayer in sublayers {
-            let copyLayer = CALayer()
-            copyLayer.frame = sublayer.frame
-            copyLayer.backgroundColor = sublayer.backgroundColor
-            copyLayer.cornerRadius = sublayer.cornerRadius
-            copyLayer.opacity = sublayer.opacity
-
-            // If it's a shape layer (for lines), copy the path
-            if let shapeLayer = sublayer as? CAShapeLayer {
-              let copyShapeLayer = CAShapeLayer()
-              copyShapeLayer.frame = shapeLayer.frame
-              copyShapeLayer.path = shapeLayer.path
-              copyShapeLayer.strokeColor = shapeLayer.strokeColor
-              copyShapeLayer.lineWidth = shapeLayer.lineWidth
-              copyShapeLayer.fillColor = shapeLayer.fillColor
-              copyShapeLayer.opacity = shapeLayer.opacity
-              tempLayer.addSublayer(copyShapeLayer)
-            } else {
-              tempLayer.addSublayer(copyLayer)
-            }
-          }
-        }
-
-        self.layer.insertSublayer(tempLayer, above: imageLayer)
-        tempPoseLayer = tempLayer
-      }
-
-      // Add OBB layer if present (for OBB task)
-      var tempObbLayer: CALayer?
-      if let obbLayer = self.obbLayer, !obbLayer.isHidden {
-        // Create a temporary copy of the OBB layer including all sublayers
-        let tempLayer = CALayer()
-        let overlayFrame = self.overlayLayer.frame
-
-        tempLayer.frame = CGRect(
-          x: overlayFrame.origin.x,
-          y: overlayFrame.origin.y,
-          width: overlayFrame.width,
-          height: overlayFrame.height
-        )
-        tempLayer.opacity = obbLayer.opacity
-
-        // Copy all sublayers
-        if let sublayers = obbLayer.sublayers {
-          for sublayer in sublayers {
-            if let shapeLayer = sublayer as? CAShapeLayer {
-              let copyShapeLayer = CAShapeLayer()
-              copyShapeLayer.frame = shapeLayer.frame
-              copyShapeLayer.path = shapeLayer.path
-              copyShapeLayer.strokeColor = shapeLayer.strokeColor
-              copyShapeLayer.lineWidth = shapeLayer.lineWidth
-              copyShapeLayer.fillColor = shapeLayer.fillColor
-              copyShapeLayer.opacity = shapeLayer.opacity
-              tempLayer.addSublayer(copyShapeLayer)
-            } else if let textLayer = sublayer as? CATextLayer {
-              let copyTextLayer = CATextLayer()
-              copyTextLayer.frame = textLayer.frame
-              copyTextLayer.string = textLayer.string
-              copyTextLayer.font = textLayer.font
-              copyTextLayer.fontSize = textLayer.fontSize
-              copyTextLayer.foregroundColor = textLayer.foregroundColor
-              copyTextLayer.backgroundColor = textLayer.backgroundColor
-              copyTextLayer.alignmentMode = textLayer.alignmentMode
-              copyTextLayer.opacity = textLayer.opacity
-              tempLayer.addSublayer(copyTextLayer)
-            }
-          }
-        }
-
-        self.layer.insertSublayer(tempLayer, above: imageLayer)
-        tempObbLayer = tempLayer
-      }
-
       var tempViews = [UIView]()
       let boundingBoxInfos = makeBoundingBoxInfos(from: boundingBoxViews)
       for info in boundingBoxInfos where !info.isHidden {
@@ -1424,12 +1306,7 @@ extension YOLOView: AVCapturePhotoCaptureDelegate {
       self.drawHierarchy(in: bounds, afterScreenUpdates: true)
       let img = UIGraphicsGetImageFromCurrentImageContext()
       UIGraphicsEndImageContext()
-
-      // Clean up temporary layers and views
       imageLayer.removeFromSuperlayer()
-      tempMaskLayer?.removeFromSuperlayer()
-      tempPoseLayer?.removeFromSuperlayer()
-      tempObbLayer?.removeFromSuperlayer()
       for v in tempViews {
         v.removeFromSuperview()
       }
@@ -1691,12 +1568,22 @@ extension YOLOView: AVCapturePhotoCaptureDelegate {
     }
 
     // Add original image (if available and enabled)
+    // if config.includeOriginalImage {
+    //   if let pixelBuffer = currentBuffer {
+    //     if let imageData = convertPixelBufferToJPEGData(pixelBuffer) {
+    //       map["originalImage"] = imageData
+    //       print("YOLOView: ✅ Added original image data (\(imageData.count) bytes)")
+    //     }
+    //   }
+    // }
+
+
     if config.includeOriginalImage {
-      if let pixelBuffer = currentBuffer {
-        if let imageData = convertPixelBufferToJPEGData(pixelBuffer) {
-          map["originalImage"] = imageData
-          print("YOLOView: ✅ Added original image data (\(imageData.count) bytes)")
-        }
+      // MODIFIED: Access the originalImage directly from the result object
+      if let originalImage = result.originalImage, let imageData = originalImage.jpegData(compressionQuality: 0.9) {
+        // MODIFIED: Wrap the data in FlutterStandardTypedData for the channel
+        map["originalImage"] = FlutterStandardTypedData(bytes: imageData)
+        print("YOLOView: ✅ Added original image data (\(imageData.count) bytes)")
       }
     }
 

@@ -61,6 +61,7 @@ class VideoCapture: NSObject, @unchecked Sendable {
   var shortSide: CGFloat = 4
   var frameSizeCaptured = false
 
+  // This is no longer needed for passing data, but BasePredictor uses it to prevent concurrent processing.
   private var currentBuffer: CVPixelBuffer?
 
   func setUp(
@@ -178,13 +179,15 @@ class VideoCapture: NSObject, @unchecked Sendable {
     } catch {}
   }
 
+  // MODIFIED: This method now extracts the pixel buffer and calls the new predictor method.
   private func predictOnFrame(sampleBuffer: CMSampleBuffer) {
     guard let predictor = predictor else {
       print("predictor is nil")
       return
     }
-    if currentBuffer == nil, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-      currentBuffer = pixelBuffer
+
+    // Extract the pixel buffer from the sample buffer
+    if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
       if !frameSizeCaptured {
         let frameWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
         let frameHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
@@ -193,28 +196,8 @@ class VideoCapture: NSObject, @unchecked Sendable {
         frameSizeCaptured = true
       }
 
-      /// - Tag: MappingOrientation
-      // The frame is always oriented based on the camera sensor,
-      // so in most cases Vision needs to rotate it for the model to work as expected.
-      var imageOrientation: CGImagePropertyOrientation = .up
-      //            switch UIDevice.current.orientation {
-      //            case .portrait:
-      //                imageOrientation = .up
-      //            case .portraitUpsideDown:
-      //                imageOrientation = .down
-      //            case .landscapeLeft:
-      //                imageOrientation = .up
-      //            case .landscapeRight:
-      //                imageOrientation = .up
-      //            case .unknown:
-      //                imageOrientation = .up
-      //
-      //            default:
-      //                imageOrientation = .up
-      //            }
-
-      predictor.predict(sampleBuffer: sampleBuffer, onResultsListener: self, onInferenceTime: self)
-      currentBuffer = nil
+      // Call the modified predict method with the pixelBuffer directly
+      predictor.predict(pixelBuffer: pixelBuffer, onResultsListener: self, onInferenceTime: self)
     }
   }
 
@@ -228,7 +211,6 @@ class VideoCapture: NSObject, @unchecked Sendable {
     } else {
       connection.isVideoMirrored = false
     }
-    let o = connection.videoOrientation
     self.previewLayer?.connection?.videoOrientation = connection.videoOrientation
   }
 
